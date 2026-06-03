@@ -1053,6 +1053,10 @@ fn serial_manager_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, Backend
         (libc::SYS_recvfrom, vec![]),
         (libc::SYS_rt_sigprocmask, vec![]),
         (libc::SYS_rt_sigreturn, vec![]),
+        // Replaying the buffered backlog to a freshly-connected client is the
+        // first time this thread writes to the socket (input is read via
+        // recvfrom above); the write goes out via sendto.
+        (libc::SYS_sendto, vec![]),
         (libc::SYS_shutdown, vec![]),
         (libc::SYS_sigaltstack, vec![]),
         (libc::SYS_write, vec![]),
