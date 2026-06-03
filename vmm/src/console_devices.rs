@@ -16,10 +16,12 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 use std::{io, result};
 
 use libc::{TCSANOW, cfmakeraw, isatty, tcgetattr, tcsetattr, termios};
+use serial_buffer::SerialBuffer;
 use thiserror::Error;
 
 use crate::Vmm;
@@ -61,8 +63,27 @@ pub enum ConsoleTransport {
     Pty(Arc<File>),
     Tty(Arc<File>),
     Null,
-    Socket(Arc<UnixListener>),
+    Socket(Arc<SerialSocketBackend>),
     Off,
+}
+
+/// Host-side state for a serial console in Socket mode that must outlive a
+/// guest reboot: the bound listener and the output history buffer (with its
+/// write-through gate). Owning this above the VM (in `Vmm`) lets a reboot reset
+/// only the guest UART while the socket, the connected client and the captured
+/// history persist. The socket file is unlinked when this is dropped — i.e. on
+/// real VM teardown (shutdown/delete), not on reboot.
+pub struct SerialSocketBackend {
+    pub listener: Arc<UnixListener>,
+    pub buffer: Arc<Mutex<SerialBuffer>>,
+    pub write_out: Arc<AtomicBool>,
+    pub socket_path: PathBuf,
+}
+
+impl Drop for SerialSocketBackend {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.socket_path);
+    }
 }
 
 #[derive(Clone)]
@@ -255,9 +276,30 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
                 ConsoleTransport::Tty(Arc::new(stdout))
             }
             ConsoleOutputMode::Socket => {
-                let listener = UnixListener::bind(vmconfig.serial.common.socket.as_ref().unwrap())
-                    .map_err(ConsoleDeviceError::CreateConsoleDevice)?;
-                ConsoleTransport::Socket(Arc::new(listener))
+                // Reuse the Vmm-scoped backend across reboot so the listener,
+                // the connected client and the captured history survive; only
+                // bind (and create the buffer) on the first boot.
+                let backend = if let Some(backend) = vmm.serial_socket_backend.clone() {
+                    backend
+                } else {
+                    let socket_path = vmconfig.serial.common.socket.as_ref().unwrap().clone();
+                    let listener = UnixListener::bind(&socket_path)
+                        .map_err(ConsoleDeviceError::CreateConsoleDevice)?;
+                    let write_out = Arc::new(AtomicBool::new(false));
+                    let buffer = Arc::new(Mutex::new(SerialBuffer::new(
+                        Box::new(io::sink()),
+                        write_out.clone(),
+                    )));
+                    let backend = Arc::new(SerialSocketBackend {
+                        listener: Arc::new(listener),
+                        buffer,
+                        write_out,
+                        socket_path,
+                    });
+                    vmm.serial_socket_backend = Some(backend.clone());
+                    backend
+                };
+                ConsoleTransport::Socket(backend)
             }
             ConsoleOutputMode::Null => ConsoleTransport::Null,
             ConsoleOutputMode::Off => ConsoleTransport::Off,

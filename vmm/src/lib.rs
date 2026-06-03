@@ -21,7 +21,7 @@ use api::dbus::{DBusApiOptions, DBusApiShutdownChannels};
 use api::http::HttpApiHandle;
 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
 use arch::x86_64::MAX_SUPPORTED_CPUS_LEGACY;
-use console_devices::{ConsoleInfo, pre_create_console_devices};
+use console_devices::{ConsoleInfo, SerialSocketBackend, pre_create_console_devices};
 use event_monitor::event;
 use landlock::LandlockError;
 use libc::{EFD_NONBLOCK, SIGINT, SIGTERM, TCSANOW, tcsetattr, termios};
@@ -636,6 +636,11 @@ pub struct Vmm {
     original_termios_opt: Arc<Mutex<Option<termios>>>,
     console_resize_pipe: Option<Arc<File>>,
     console_info: Option<ConsoleInfo>,
+    // Vmm-scoped serial Socket backend (listener + history buffer) that
+    // survives guest reboot; see SerialSocketBackend. None until a serial in
+    // Socket mode is set up, and dropped (unlinking the socket) on real
+    // teardown.
+    serial_socket_backend: Option<Arc<SerialSocketBackend>>,
     no_shutdown: bool,
 }
 
@@ -853,6 +858,7 @@ impl Vmm {
             original_termios_opt: Arc::new(Mutex::new(None)),
             console_resize_pipe: None,
             console_info: None,
+            serial_socket_backend: None,
             no_shutdown,
         })
     }
@@ -2016,6 +2022,9 @@ impl RequestHandler for Vmm {
         let r = if let Some(ref mut vm) = self.vm.take() {
             // Drain console_info so that the FDs are not reused
             let _ = self.console_info.take();
+            // Real teardown (not reboot): drop the persistent serial Socket
+            // backend so its Drop unlinks the socket file once the VM is gone.
+            let _ = self.serial_socket_backend.take();
             vm.shutdown()
         } else {
             Err(VmError::VmNotRunning)

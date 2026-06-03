@@ -10,7 +10,6 @@ use std::os::fd::OwnedFd;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::panic::AssertUnwindSafe;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{io, result, thread};
@@ -129,7 +128,6 @@ pub struct SerialManager {
     kill_evt: EventFd,
     handle: Option<thread::JoinHandle<()>>,
     pty_write_out: Option<Arc<AtomicBool>>,
-    socket_path: Option<PathBuf>,
     // Socket mode only: a persistent ring buffer that captures serial output
     // even while no client is connected, and replays the backlog on connect.
     // Shared between the serial device (as its `out` sink) and the epoll thread
@@ -157,7 +155,6 @@ impl SerialManager {
         #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))] serial: Arc<Mutex<Serial>>,
         #[cfg(target_arch = "aarch64")] serial: Arc<Mutex<Pl011>>,
         mut transport: ConsoleTransport,
-        socket: Option<PathBuf>,
     ) -> Result<Option<Self>> {
         let epoll_fd = epoll::create(true).map_err(Error::Epoll)?;
         let kill_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFd)?;
@@ -169,8 +166,6 @@ impl SerialManager {
             epoll::Event::new(epoll::Events::EPOLLIN, EpollDispatch::Kill as u64),
         )
         .map_err(Error::Epoll)?;
-
-        let mut socket_path: Option<PathBuf> = None;
 
         let in_fd = match transport {
             ConsoleTransport::Pty(ref fd) => fd.as_raw_fd(),
@@ -203,12 +198,7 @@ impl SerialManager {
             ConsoleTransport::Tty(_) => {
                 return Ok(None);
             }
-            ConsoleTransport::Socket(ref listener) => {
-                if let Some(path_in_socket) = socket {
-                    socket_path = Some(path_in_socket.clone());
-                }
-                listener.as_raw_fd()
-            }
+            ConsoleTransport::Socket(ref backend) => backend.listener.as_raw_fd(),
             _ => return Ok(None),
         };
 
@@ -239,26 +229,26 @@ impl SerialManager {
                 .set_out(Some(Box::new(buffer)));
         }
 
-        // Socket mode: install a persistent ring buffer as the device's output
-        // sink up front (discarding downstream via io::sink() until a client
-        // connects), so output emitted before the first connection is captured
-        // and replayed instead of dropped. The buffer is shared with the epoll
-        // thread, which retargets it at the accepted client on connect.
+        // Socket mode: install the Vmm-scoped persistent ring buffer as the
+        // device's output sink. It is owned by the SerialSocketBackend (so it
+        // survives a guest reboot) and shared with the epoll thread, which
+        // retargets it at the accepted client on connect. Reset it to the
+        // detached state here — drop any stale writer left over from a previous
+        // boot (clean EOF for that client) and resume accumulating — while
+        // keeping the existing history ring so a reconnecting client still sees
+        // it. Output emitted before the first connect is captured, not dropped.
         let mut socket_buffer = None;
         let mut socket_write_out = None;
-        if let ConsoleTransport::Socket(_) = transport {
-            let write_out = Arc::new(AtomicBool::new(false));
-            let buffer = Arc::new(Mutex::new(SerialBuffer::new(
-                Box::new(io::sink()),
-                write_out.clone(),
-            )));
+        if let ConsoleTransport::Socket(ref backend) = transport {
+            backend.write_out.store(false, Ordering::Release);
+            backend.buffer.lock().unwrap().set_out(Box::new(io::sink()));
             serial
                 .as_ref()
                 .lock()
                 .unwrap()
-                .set_out(Some(Box::new(SharedSerialBuffer(buffer.clone()))));
-            socket_buffer = Some(buffer);
-            socket_write_out = Some(write_out);
+                .set_out(Some(Box::new(SharedSerialBuffer(backend.buffer.clone()))));
+            socket_buffer = Some(backend.buffer.clone());
+            socket_write_out = Some(backend.write_out.clone());
         }
 
         // Use 'OwnedFd' to manage lifetime
@@ -272,7 +262,6 @@ impl SerialManager {
             kill_evt,
             handle: None,
             pty_write_out,
-            socket_path,
             socket_buffer,
             socket_write_out,
         }))
@@ -438,14 +427,16 @@ impl SerialManager {
                                             .map_err(Error::AcceptConnection)?;
                                     }
 
-                                    let ConsoleTransport::Socket(ref listener) = transport else {
+                                    let ConsoleTransport::Socket(ref backend) = transport else {
                                         unreachable!();
                                     };
 
                                     // Events on the listening socket will be connection requests.
                                     // Accept them, create a reader and a writer.
-                                    let (unix_stream, _) =
-                                        listener.accept().map_err(Error::AcceptConnection)?;
+                                    let (unix_stream, _) = backend
+                                        .listener
+                                        .accept()
+                                        .map_err(Error::AcceptConnection)?;
                                     // Non-blocking so a slow/stalled client
                                     // can't block the vCPU during replay or
                                     // live writes (SerialBuffer re-buffers on
@@ -576,12 +567,7 @@ impl Drop for SerialManager {
         if let Some(handle) = self.handle.take() {
             handle.join().ok();
         }
-        if let ConsoleTransport::Socket(_) = self.transport
-            && let Some(socket_path) = self.socket_path.as_ref()
-        {
-            std::fs::remove_file(socket_path.as_os_str())
-                .map_err(Error::RemoveUnixSocket)
-                .ok();
-        }
+        // The Socket file is unlinked by SerialSocketBackend::drop on real VM
+        // teardown (shutdown/delete), not here — so it persists across reboot.
     }
 }
